@@ -6,6 +6,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use clap::{arg, command, value_parser, ArgMatches};
 use handlebars::Handlebars;
 use walkdir::WalkDir;
 
@@ -15,15 +16,29 @@ const VALUES_FILE: &str = "values.toml";
 const TEMPLATE_EXTENSION: &str = "hbs"; // handlebars template
 
 static HANDLEBARS: OnceLock<Mutex<Handlebars>> = OnceLock::new();
+static DEBUG: OnceLock<bool> = OnceLock::new();
 
 fn main() -> anyhow::Result<()> {
-    initialize_global();
+    let matches = command!()
+        .arg(
+            arg!(-c --config <FILE> "Use a custom config file")
+                .value_parser(value_parser!(PathBuf))
+                .default_value(VALUES_FILE),
+        )
+        .arg(arg!(-d --debug ... "Turn debugging on"))
+        .get_matches();
+
+    initialize_global(&matches);
+    let config_file = matches.get_one::<PathBuf>("config").unwrap();
 
     let input_paths = WalkDir::new(INPUT_DIR)
         .into_iter()
         .filter_map(|x| {
             let entry = x.unwrap();
             let path = entry.path();
+            if *DEBUG.get().unwrap() {
+                println!("Getting metadata for {}", path.display());
+            }
             let metadata = fs::metadata(path).unwrap();
             if metadata.is_file() {
                 Some(path.to_path_buf())
@@ -37,7 +52,7 @@ fn main() -> anyhow::Result<()> {
         .any(|x| x.extension().and_then(|s| s.to_str()).unwrap_or("") == TEMPLATE_EXTENSION);
     let mut output_paths = vec![];
     if has_templates {
-        let values = get_values();
+        let values = get_values(config_file);
         for path in input_paths {
             let output_path =
                 if path.extension().and_then(|s| s.to_str()).unwrap_or("") == TEMPLATE_EXTENSION {
@@ -60,18 +75,23 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn initialize_global() {
+fn initialize_global(matches: &ArgMatches) {
     let _ = HANDLEBARS.get_or_init(|| {
         let mut instance = Handlebars::new();
         instance.register_escape_fn(handlebars::no_escape);
         Mutex::new(instance)
     });
+    let _ = DEBUG.get_or_init(|| !matches!(matches.get_one::<u8>("debug").unwrap(), 0));
 }
 
-fn get_values() -> toml::Table {
-    let values_path = Path::new(VALUES_FILE);
+fn get_values(values_path: &PathBuf) -> toml::Table {
     if values_path.exists() {
-        println!("values.toml found. Using values.toml as templating values");
+        if *DEBUG.get().unwrap() {
+            println!(
+                "${} found. Using values.toml as templating values",
+                values_path.display()
+            );
+        }
         let data = fs::read_to_string(values_path).unwrap();
         data.parse::<toml::Table>().unwrap()
     } else {
@@ -91,17 +111,25 @@ fn create_symlink(original_path: &Path) {
 
     let _ = fs::remove_file(&target_path);
 
+    let target_path_parent = target_path.parent().unwrap();
+
+    if !target_path_parent.exists() {
+        let _ = fs::create_dir_all(target_path_parent);
+    }
+
+    if *DEBUG.get().unwrap() {
+        println!(
+            "Symlinked: {} -> {}",
+            &original_path.display(),
+            &target_path.display()
+        );
+    }
+
     unix::fs::symlink(
         home_path.join(original_path.canonicalize().unwrap()),
         &target_path,
     )
     .unwrap();
-
-    println!(
-        "Symlinked: {} -> {}",
-        &original_path.display(),
-        &target_path.display()
-    );
 }
 
 fn render_template_file(path: &Path, data: &toml::Table) -> anyhow::Result<PathBuf> {
@@ -116,7 +144,9 @@ fn render_template_file(path: &Path, data: &toml::Table) -> anyhow::Result<PathB
     let _ = fs::create_dir_all(next_path.parent().unwrap());
     let mut output_file = File::create(&next_path)?;
     handlebars.render_to_write(path_str, &data, &mut output_file)?;
-    println!("Templated: {} -> {}", &path.display(), &next_path.display());
+    if *DEBUG.get().unwrap() {
+        println!("Templated: {} -> {}", &path.display(), &next_path.display());
+    }
     Ok(next_path.to_path_buf())
 }
 
